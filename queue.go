@@ -5,19 +5,27 @@ import (
 	"encoding/gob"
 	"os"
 	"sync"
+	"time"
 
+	"github.com/golang/glog"
 	"github.com/syndtr/goleveldb/leveldb"
 )
 
 // Queue is a standard FIFO (first in, first out) queue.
 type Queue struct {
 	sync.RWMutex
-	DataDir string
-	db      *leveldb.DB
-	head    uint64
-	tail    uint64
-	isOpen  bool
+	notEmpty chan bool
+	DataDir  string
+	db       *leveldb.DB
+	head     uint64
+	tail     uint64
+	isOpen   bool
+	closed   chan bool
 }
+
+// queue will wake up pop wait regularly based on FREQ_WAKE_UP_POP
+// make this small to increase throughput, big to avoid busy check
+const FREQ_WAKE_UP_POP = 100 * time.Millisecond
 
 // OpenQueue opens a queue if one exists at the given directory. If one
 // does not already exist, a new queue is created.
@@ -32,6 +40,10 @@ func OpenQueue(dataDir string) (*Queue, error) {
 		tail:    0,
 		isOpen:  false,
 	}
+	q.notEmpty = make(chan bool, 1)
+
+	// closed is used to signal pop waker to terminate
+	q.closed = make(chan bool)
 
 	// Open database for the queue.
 	q.db, err = leveldb.OpenFile(dataDir, nil)
@@ -78,6 +90,12 @@ func (q *Queue) Enqueue(value []byte) (*Item, error) {
 	// Increment tail position.
 	q.tail++
 
+	// This is the best effort in terms of signaling
+	select {
+	case q.notEmpty <- true:
+	default:
+	}
+
 	return item, nil
 }
 
@@ -99,14 +117,57 @@ func (q *Queue) EnqueueObject(value interface{}) (*Item, error) {
 	return q.Enqueue(buffer.Bytes())
 }
 
-// Dequeue removes the next item in the queue and returns it.
-func (q *Queue) Dequeue() (*Item, error) {
+/* Pop removes and returns an item from the queue.
+
+If optional args 'block' is true and 'timeout' is not given, block if necessary
+until an item is available.
+If 'timeout' is a non-negative time duration, it blocks at most 'timeout'
+millisecond and raises the Empty exception if no item was available within that
+time.
+Otherwise ('block' is false), return an item if one is immediately available,
+else raise the error we caught ('timeout' is ignored in that case).
+*/
+func (q *Queue) Pop(block bool, timeout ...time.Duration) (*Item, error) {
 	q.Lock()
 	defer q.Unlock()
 
 	// Check if queue is closed.
 	if !q.isOpen {
 		return nil, ErrDBClosed
+	}
+
+	if !block {
+		if q.Length() == 0 {
+			return nil, ErrEmpty
+		}
+	} else if timeout == nil {
+		for q.Length() == 0 {
+			q.Unlock()
+			<-q.notEmpty
+			q.Lock()
+		}
+	} else {
+		if len(timeout) > 1 {
+			glog.V(1).Info("only the first timeout accepted, others ignored")
+		}
+
+		start := time.Now()
+		timer := time.NewTimer(timeout[0])
+		for q.Length() == 0 {
+			q.Unlock()
+			select {
+			case <-q.notEmpty:
+			case <-timer.C:
+			}
+			q.Lock()
+
+			remaining := timeout[0] - time.Now().Sub(start)
+			if remaining <= 0 {
+				break
+			}
+			timer.Reset(remaining)
+		}
+		timer.Stop()
 	}
 
 	// Try to get the next item in the queue.
@@ -124,6 +185,15 @@ func (q *Queue) Dequeue() (*Item, error) {
 	q.head++
 
 	return item, nil
+}
+
+// Dequeue removes and returns the next item in the queue without blocking
+func (q *Queue) Dequeue() (*Item, error) {
+	if item, err := q.Pop(false); err != nil {
+		return nil, err
+	} else {
+		return item, nil
+	}
 }
 
 // Peek returns the next item in the queue without removing it.
@@ -234,11 +304,13 @@ func (q *Queue) Close() error {
 		return err
 	}
 
-	// Reset queue head and tail and set
-	// isOpen to false.
+	// Reset queue head and tail,
+	// set isOpen to false,
+	// and signal pop waker to terminate.
 	q.head = 0
 	q.tail = 0
 	q.isOpen = false
+	close(q.closed)
 
 	return nil
 }
@@ -286,6 +358,21 @@ func (q *Queue) init() error {
 	if iter.Last() {
 		q.tail = keyToID(iter.Key())
 	}
+
+	// regularly wake up pop to avoid infinite block, return when queue is closed
+	go func(q *Queue) {
+		for {
+			select {
+			case <-time.After(FREQ_WAKE_UP_POP):
+				select {
+				case q.notEmpty <- true:
+				default:
+				}
+			case <-q.closed:
+				return
+			}
+		}
+	}(q)
 
 	return iter.Error()
 }
